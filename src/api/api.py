@@ -7,10 +7,18 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 import random
+from fastmcp import FastMCP
 
 app = FastAPI()
 leetcode_url = "https://leetcode.com/graphql"
 client = httpx.AsyncClient()
+
+# 1. Generate MCP server from your API
+mcp = FastMCP.from_fastapi(app=app, name="LeetCode MCP")
+
+# 2. Create the MCP's ASGI app
+mcp_app = mcp.http_app(path="/mcp")
+
 
 class QuestionCache:
     def __init__(self):
@@ -24,7 +32,10 @@ class QuestionCache:
 
     async def initialize(self):
         async with self.lock:
-            if not self.questions or (time.time() - self.last_updated) > self.update_interval:
+            if (
+                not self.questions
+                or (time.time() - self.last_updated) > self.update_interval
+            ):
                 await self._fetch_all_questions()
                 self.last_updated = time.time()
 
@@ -48,32 +59,51 @@ class QuestionCache:
                 }
             }
         }"""
-        
+
         try:
             response = await client.post(leetcode_url, json={"query": query})
             if response.status_code == 200:
                 data = response.json()
                 questions = data["data"]["problemsetQuestionList"]["questions"]
-                
+
                 self.questions.clear()
                 self.slug_to_id.clear()
                 self.frontend_id_to_slug.clear()
-                
+
                 for q in questions:
                     self.questions[q["questionId"]] = q
                     self.slug_to_id[q["titleSlug"]] = q["questionId"]
-                    self.frontend_id_to_slug[q["questionFrontendId"]] = q["titleSlug"]                    
+                    self.frontend_id_to_slug[q["questionFrontendId"]] = q["titleSlug"]
         except Exception as e:
             print(f"Error updating questions: {e}")
 
+
 cache = QuestionCache()
+
+
+@asynccontextmanager
+async def app_lifespan(app: FastAPI):
+    # Startup
+    print("Starting up the app...")
+    # Initialize database, cache, etc.
+    await cache.initialize()
+    yield
+    # Shutdown
+    print("Shutting down the app...")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await cache.initialize()
-    yield
+    async with app_lifespan(app):
+        async with mcp_app.lifespan(app):
+            yield
+
 
 app = FastAPI(lifespan=lifespan)
+
+# 3. Mount it back into your FastAPI app
+app.mount("/llm", mcp_app)
+
 
 async def fetch_with_retry(url: str, payload: dict, retries: int = 3):
     for _ in range(retries):
@@ -86,25 +116,30 @@ async def fetch_with_retry(url: str, payload: dict, retries: int = 3):
             await asyncio.sleep(1)
     return None
 
+
 @app.get("/problems", tags=["Problems"])
 async def get_all_problems():
     await cache.initialize()
-    return [{
-        "id": q["questionId"],
-        "frontend_id": q["questionFrontendId"],
-        "title": q["title"],
-        "title_slug": q["titleSlug"],
-        "url": f"https://leetcode.com/problems/{q['titleSlug']}/",
-        "difficulty": q["difficulty"],                
-        "paid_only": q["paidOnly"],        
-        "has_solution": q["hasSolution"],
-        "has_video_solution": q["hasVideoSolution"],        
-    } for q in cache.questions.values()]
+    return [
+        {
+            "id": q["questionId"],
+            "frontend_id": q["questionFrontendId"],
+            "title": q["title"],
+            "title_slug": q["titleSlug"],
+            "url": f"https://leetcode.com/problems/{q['titleSlug']}/",
+            "difficulty": q["difficulty"],
+            "paid_only": q["paidOnly"],
+            "has_solution": q["hasSolution"],
+            "has_video_solution": q["hasVideoSolution"],
+        }
+        for q in cache.questions.values()
+    ]
+
 
 @app.get("/problem/{id_or_slug}", tags=["Problems"])
 async def get_problem(id_or_slug: str):
     await cache.initialize()
-    
+
     if id_or_slug in cache.frontend_id_to_slug:
         slug = cache.frontend_id_to_slug[id_or_slug]
     elif id_or_slug in cache.slug_to_id:
@@ -139,21 +174,19 @@ async def get_problem(id_or_slug: str):
             hasVideoSolution
         }
     }"""
-    
-    payload = {
-        "query": query,
-        "variables": {"titleSlug": slug}
-    }
-    
+
+    payload = {"query": query, "variables": {"titleSlug": slug}}
+
     data = await fetch_with_retry(leetcode_url, payload)
     if not data or "data" not in data or not data["data"]["question"]:
         raise HTTPException(status_code=404, detail="Question data not found")
-    
+
     question_data = data["data"]["question"]
     question_data["url"] = f"https://leetcode.com/problems/{slug}/"
-        
+
     cache.question_details[question_id] = question_data
     return question_data
+
 
 @app.get("/search", tags=["Problems"])
 async def search_problems(query: str):
@@ -165,14 +198,17 @@ async def search_problems(query: str):
     results = []
     for q in cache.questions.values():
         if query_lower in q["title"].lower():
-            results.append({
-                "id": q["questionId"],
-                "frontend_id": q["questionFrontendId"],
-                "title": q["title"],
-                "title_slug": q["titleSlug"],
-                "url": f"https://leetcode.com/problems/{q['titleSlug']}/"
-            })
+            results.append(
+                {
+                    "id": q["questionId"],
+                    "frontend_id": q["questionFrontendId"],
+                    "title": q["title"],
+                    "title_slug": q["titleSlug"],
+                    "url": f"https://leetcode.com/problems/{q['titleSlug']}/",
+                }
+            )
     return results
+
 
 @app.get("/random", tags=["Problems"])
 async def get_random_problem():
@@ -188,8 +224,9 @@ async def get_random_problem():
         "frontend_id": q["questionFrontendId"],
         "title": q["title"],
         "title_slug": q["titleSlug"],
-        "url": f"https://leetcode.com/problems/{q['titleSlug']}/"
+        "url": f"https://leetcode.com/problems/{q['titleSlug']}/",
     }
+
 
 @app.get("/user/{username}", tags=["Users"])
 async def get_user_profile(username: str):
@@ -241,13 +278,13 @@ async def get_user_profile(username: str):
                 }
             }
         }"""
-        
+
         payload = {
             "query": query,
             "variables": {"username": username},
-            "operationName": "userPublicProfile"
+            "operationName": "userPublicProfile",
         }
-        
+
         try:
             response = await client.post(leetcode_url, json=payload)
             if response.status_code == 200:
@@ -255,9 +292,12 @@ async def get_user_profile(username: str):
                 if not data.get("data", {}).get("matchedUser"):
                     raise HTTPException(status_code=404, detail="User not found")
                 return data["data"]["matchedUser"]
-            raise HTTPException(status_code=response.status_code, detail="Error fetching user profile")
+            raise HTTPException(
+                status_code=response.status_code, detail="Error fetching user profile"
+            )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/user/{username}/contests", tags=["Users"])
 async def get_user_contest_history(username: str):
@@ -287,13 +327,13 @@ async def get_user_contest_history(username: str):
                 }
             }
         }"""
-        
+
         payload = {
             "query": query,
             "variables": {"username": username},
-            "operationName": "userContestRankingInfo"
+            "operationName": "userContestRankingInfo",
         }
-        
+
         try:
             response = await client.post(leetcode_url, json=payload)
             if response.status_code == 200:
@@ -301,9 +341,13 @@ async def get_user_contest_history(username: str):
                 if not data.get("data"):
                     raise HTTPException(status_code=404, detail="User not found")
                 return data["data"]
-            raise HTTPException(status_code=response.status_code, detail="Error fetching contest history")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail="Error fetching contest history",
+            )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/user/{username}/submissions", tags=["Users"])
 async def get_recent_submissions(username: str, limit: int = 20):
@@ -331,12 +375,9 @@ async def get_recent_submissions(username: str, limit: int = 20):
                 }
             }
         }"""
-        
-        payload = {
-            "query": query,
-            "variables": {"username": username, "limit": limit}
-        }
-        
+
+        payload = {"query": query, "variables": {"username": username, "limit": limit}}
+
         try:
             response = await client.post(leetcode_url, json=payload)
             if response.status_code == 200:
@@ -344,7 +385,9 @@ async def get_recent_submissions(username: str, limit: int = 20):
                 if "errors" in data:
                     raise HTTPException(status_code=404, detail="User not found")
                 return data["data"]["recentSubmissionList"]
-            raise HTTPException(status_code=response.status_code, detail="Error fetching submissions")
+            raise HTTPException(
+                status_code=response.status_code, detail="Error fetching submissions"
+            )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
@@ -373,17 +416,21 @@ async def get_daily_challenge():
                 }
             }
         }"""
-        
+
         payload = {"query": query}
-        
+
         try:
             response = await client.post(leetcode_url, json=payload)
             if response.status_code == 200:
                 data = response.json()
                 return data["data"]["activeDailyCodingChallengeQuestion"]
-            raise HTTPException(status_code=response.status_code, detail="Error fetching daily challenge")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail="Error fetching daily challenge",
+            )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/health", tags=["Utility"])
 async def health_check():
@@ -393,7 +440,9 @@ async def health_check():
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def home():
     from src.api.home import HOME_PAGE_HTML
-    return HOME_PAGE_HTML 
+
+    return HOME_PAGE_HTML
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
