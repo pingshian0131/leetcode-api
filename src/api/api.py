@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from contextlib import asynccontextmanager
 import httpx
@@ -219,6 +220,7 @@ async def get_random_problem():
     if not cache.questions:
         raise HTTPException(status_code=404, detail="No questions available")
     q = random.choice(list(cache.questions.values()))
+    logging.warning(f"Random problem: {q['title']}")
     return {
         "id": q["questionId"],
         "frontend_id": q["questionFrontendId"],
