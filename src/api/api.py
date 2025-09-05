@@ -88,7 +88,6 @@ async def app_lifespan(app: FastAPI):
     print("Starting up the app...")
     # Initialize database, cache, etc.
     await cache.initialize()
-    yield
     # Shutdown
     print("Shutting down the app...")
 
